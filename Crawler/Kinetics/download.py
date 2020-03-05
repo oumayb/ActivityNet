@@ -1,11 +1,11 @@
 import argparse
+import fnmatch
 import glob
 import json
 import os
 import shutil
 import subprocess
 import uuid
-from collections import OrderedDict
 
 from joblib import delayed
 from joblib import Parallel
@@ -14,12 +14,6 @@ import pandas as pd
 
 def create_video_folders(dataset, output_dir, tmp_dir):
     """Creates a directory for each label name in the dataset."""
-    if 'label-name' not in dataset.columns:
-        this_dir = os.path.join(output_dir, 'test')
-        if not os.path.exists(this_dir):
-            os.makedirs(this_dir)
-        # I should return a dict but ...
-        return this_dir
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     if not os.path.exists(tmp_dir):
@@ -41,11 +35,7 @@ def construct_video_filename(row, label_to_dir, trim_format='%06d'):
     basename = '%s_%s_%s.mp4' % (row['video-id'],
                                  trim_format % row['start-time'],
                                  trim_format % row['end-time'])
-    if not isinstance(label_to_dir, dict):
-        dirname = label_to_dir
-    else:
-        dirname = label_to_dir[row['label-name']]
-    output_filename = os.path.join(dirname, basename)
+    output_filename = os.path.join(label_to_dir[row['label-name']], basename)
     return output_filename
 
 
@@ -75,19 +65,19 @@ def download_clip(video_identifier, output_filename,
 
     status = False
     # Construct command line for getting the direct video link.
-    tmp_filename = os.path.join(tmp_dir,
-                                '%s.%%(ext)s' % uuid.uuid4())
     command = ['youtube-dl',
                '--quiet', '--no-warnings',
                '-f', 'mp4',
-               '-o', '"%s"' % tmp_filename,
+               '--get-url', '-i',
                '"%s"' % (url_base + video_identifier)]
     command = ' '.join(command)
     attempts = 0
     while True:
         try:
-            output = subprocess.check_output(command, shell=True,
-                                             stderr=subprocess.STDOUT)
+            direct_download_url = subprocess.check_output(command,
+                                                          shell=True,
+                                                          stderr=subprocess.STDOUT)
+            direct_download_url = direct_download_url.strip().decode('utf-8')
         except subprocess.CalledProcessError as err:
             attempts += 1
             if attempts == num_attempts:
@@ -95,13 +85,12 @@ def download_clip(video_identifier, output_filename,
         else:
             break
 
-    tmp_filename = glob.glob('%s*' % tmp_filename.split('.')[0])[0]
     # Construct command to trim the videos (ffmpeg required).
     command = ['ffmpeg',
-               '-i', '"%s"' % tmp_filename,
                '-ss', str(start_time),
                '-t', str(end_time - start_time),
-               '-c:v', 'libx264', '-c:a', 'copy',
+               '-i', "'%s'" % direct_download_url,
+               '-c:v', 'copy', '-c:a', 'copy',
                '-threads', '1',
                '-loglevel', 'panic',
                '"%s"' % output_filename]
@@ -114,7 +103,6 @@ def download_clip(video_identifier, output_filename,
 
     # Check if the video was successfully saved.
     status = os.path.exists(output_filename)
-    os.remove(tmp_filename)
     return status, 'Downloaded'
 
 
@@ -134,7 +122,7 @@ def download_clip_wrapper(row, label_to_dir, trim_format, tmp_dir):
     return status
 
 
-def parse_kinetics_annotations(input_csv, ignore_is_cc=False):
+def parse_kinetics_annotations(input_csv):
     """Returns a parsed DataFrame.
 
     arguments:
@@ -142,7 +130,6 @@ def parse_kinetics_annotations(input_csv, ignore_is_cc=False):
     input_csv: str
         Path to CSV file containing the following columns:
           'YouTube Identifier,Start time,End time,Class label'
-
     returns:
     -------
     dataset: DataFrame
@@ -150,33 +137,18 @@ def parse_kinetics_annotations(input_csv, ignore_is_cc=False):
             'video-id', 'start-time', 'end-time', 'label-name'
     """
     df = pd.read_csv(input_csv)
-    if 'youtube_id' in df.columns:
-        columns = OrderedDict([
-            ('youtube_id', 'video-id'),
-            ('time_start', 'start-time'),
-            ('time_end', 'end-time'),
-            ('label', 'label-name')])
-        df.rename(columns=columns, inplace=True)
-        if ignore_is_cc:
-            df = df.loc[:, df.columns.tolist()[:-1]]
+    df.rename(columns={'youtube_id': 'video-id',
+                       'time_start': 'start-time',
+                       'time_end': 'end-time',
+                       'label': 'label-name',
+                       'is_cc': 'is-cc'}, inplace=True)
     return df
 
 
 def main(input_csv, output_dir,
-         trim_format='%06d', num_jobs=24, tmp_dir='/tmp/kinetics',
-         drop_duplicates=False):
-
+         trim_format='%06d', num_jobs=24, tmp_dir='/tmp/kinetics'):
     # Reading and parsing Kinetics.
     dataset = parse_kinetics_annotations(input_csv)
-    # if os.path.isfile(drop_duplicates):
-    #     print('Attempt to remove duplicates')
-    #     old_dataset = parse_kinetics_annotations(drop_duplicates,
-    #                                              ignore_is_cc=True)
-    #     df = pd.concat([dataset, old_dataset], axis=0, ignore_index=True)
-    #     df.drop_duplicates(inplace=True, keep=False)
-    #     print(dataset.shape, old_dataset.shape)
-    #     dataset = df
-    #     print(dataset.shape)
 
     # Creates folders where videos will be saved later.
     label_to_dir = create_video_folders(dataset, output_dir, tmp_dir)
@@ -214,7 +186,4 @@ if __name__ == '__main__':
                          'videoid_%0xd(start_time)_%0xd(end_time).mp4'))
     p.add_argument('-n', '--num-jobs', type=int, default=24)
     p.add_argument('-t', '--tmp-dir', type=str, default='/tmp/kinetics')
-    p.add_argument('--drop-duplicates', type=str, default='non-existent',
-                   help='Unavailable at the moment')
-                   # help='CSV file of the previous version of Kinetics.')
     main(**vars(p.parse_args()))
